@@ -1,8 +1,8 @@
 # Employee Attendance Extractor
 
 Converts an ESSL biometric machine's **Monthly Status Report (Basic Report)**
-PDF into a clean `attendance_summary.xlsx`. Works for any month — 28, 29, 30,
-or 31 days, any employee count — with **zero code changes**.
+PDF into a clean `attendance_summary.xlsx`. Works for any month 28, 29, 30,
+or 31 days, any employee count  with **zero code changes**.
 
 ## Setup
 
