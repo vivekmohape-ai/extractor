@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Logs — regenerated automatically by logger.py on first run
+logs/*.log
+
+# Never commit real attendance data or generated output
+sample_reports/*.pdf
+*.xlsx
+!sample_reports/.gitkeep
