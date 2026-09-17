@@ -1,181 +1,596 @@
 """
-utils.py
+Utility functions for parsing ESSL Monthly Status Reports.
 
-Small, dependency-light helper functions shared by parser.py and app.py.
-Nothing here should know about Streamlit or openpyxl — keep it pure.
+The ESSL Basic Report has a structure similar to:
+
+    Sl Emp.Code Name <daily status cells...> P A L H HP WO WOP
+
+Important:
+    pdfplumber.extract_text() does not preserve empty table cells.
+    Therefore, the number of extracted daily status tokens can vary
+    from employee to employee.
+
+This module intentionally does NOT assume that exactly `days_in_month`
+daily status tokens exist.
+
+Instead, it:
+    1. Reads Sl and Emp Code from the first two tokens.
+    2. Reads the final 7 numeric tokens as the machine summary.
+    3. Walks backwards through the middle section and identifies
+       recognized attendance status tokens.
+    4. Treats all remaining middle tokens as the employee name.
 """
 
 from __future__ import annotations
 
 import calendar
 import re
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, List, Optional, Any
 
-from dateutil import parser as dateparser
 
-from config import ABSENT_STATUS, FALLBACK_STATUS_WEIGHTS, NUM_SUMMARY_COLUMNS
+# ESSL summary columns at the end of every employee row.
+SUMMARY_COLUMNS = [
+    "P",
+    "A",
+    "L",
+    "H",
+    "HP",
+    "WO",
+    "WOP",
+]
 
-# ---------------------------------------------------------------------------
-# Number parsing — the report sometimes prints half-day totals as "16.5",
-# "8.5", etc. Plain float() handles that; this wrapper just guards against
-# stray characters and keeps a single call site.
-# ---------------------------------------------------------------------------
-_NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
+NUM_SUMMARY_COLUMNS = len(SUMMARY_COLUMNS)
+
+
+# Recognized daily attendance status values.
+#
+# ESSL may output:
+#   P
+#   A
+#   L
+#   H
+#   HP
+#   WO
+#   WOP
+#   ½P
+#   1/2P
+#   0.5P
+#
+# We normalize them before further processing.
+DAILY_STATUS_ALIASES = {
+    "P": "P",
+    "A": "A",
+    "L": "L",
+    "H": "H",
+    "HP": "HP",
+    "WO": "WO",
+    "WOP": "WOP",
+    "½P": "½P",
+    "1/2P": "½P",
+    "0.5P": "½P",
+    "0.5": "½P",
+}
+
+
+# Values used to calculate fallback attendance when the summary
+# cannot be trusted or is unavailable.
+DEFAULT_FALLBACK_WEIGHTS = {
+    "P": 1.0,
+    "½P": 0.5,
+    "A": 0.0,
+    "WO": 0.0,
+    "WOP": 0.0,
+    "L": 0.0,
+    "H": 0.0,
+    "HP": 0.0,
+}
+
+
+# Only A is considered an explicit absence.
+ABSENT_STATUS = {"A"}
+
+
+# Examples:
+#   Aug 01 2026 To Aug 31 2026
+#   Aug 01 2026 TO Aug 31 2026
+#   Aug 01 2026 to Aug 31 2026
+_DATE_RANGE_RE = re.compile(
+    r"""
+    (?P<start_month>[A-Za-z]{3,9})
+    \s+
+    (?P<start_day>\d{1,2})
+    \s+
+    (?P<start_year>\d{4})
+    \s+
+    To
+    \s+
+    (?P<end_month>[A-Za-z]{3,9})
+    \s+
+    (?P<end_day>\d{1,2})
+    \s+
+    (?P<end_year>\d{4})
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+
+_MONTH_NAME_TO_NUMBER = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+def normalize_status(token: str) -> Optional[str]:
+    """
+    Normalize a raw ESSL status token.
+
+    Returns:
+        Canonical status string, or None if the token is not
+        recognized as a daily attendance status.
+    """
+    if token is None:
+        return None
+
+    value = str(token).strip()
+
+    if not value:
+        return None
+
+    # Normalize unicode fraction / spacing variants.
+    value = value.replace(" ", "")
+    value = value.replace("𝟭", "1")
+
+    # First try exact value.
+    if value in DAILY_STATUS_ALIASES:
+        return DAILY_STATUS_ALIASES[value]
+
+    # Then uppercase.
+    upper_value = value.upper()
+
+    if upper_value in DAILY_STATUS_ALIASES:
+        return DAILY_STATUS_ALIASES[upper_value]
+
+    return None
 
 
 def is_numeric_token(token: str) -> bool:
-    return bool(_NUMERIC_RE.match(token.strip()))
+    """
+    Return True if a token can be interpreted as a number.
+
+    Supports:
+        20
+        13.5
+        9.5
+        0
+        9999
+    """
+    if token is None:
+        return False
+
+    value = str(token).strip()
+
+    if not value:
+        return False
+
+    # Remove common formatting characters.
+    value = value.replace(",", "")
+
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def to_number(token: str) -> float:
-    token = token.strip()
-    if not is_numeric_token(token):
-        raise ValueError(f"Not a numeric token: {token!r}")
-    return float(token)
+    """
+    Convert a numeric token to float.
+
+    Raises:
+        ValueError if the token is not numeric.
+    """
+    value = str(token).strip().replace(",", "")
+    return float(value)
 
 
-def format_days_present(value: float) -> float | int:
-    """Return an int when the value has no fractional part, else the float."""
+def to_display_number(value: float) -> float | int:
+    """
+    Convert 20.0 to 20 while preserving values such as 13.5.
+    """
     if float(value).is_integer():
         return int(value)
-    return value
+    return float(value)
 
 
-# ---------------------------------------------------------------------------
-# Metadata extraction
-# ---------------------------------------------------------------------------
-_DATE_RANGE_RE = re.compile(
-    r"([A-Za-z]{3}\s+\d{1,2}\s+\d{4})\s+To\s+([A-Za-z]{3}\s+\d{1,2}\s+\d{4})",
-    re.IGNORECASE,
-)
-_COMPANY_RE = re.compile(r"Company:\s*(.+?)\s+Printed On", re.IGNORECASE)
-_DEPARTMENT_RE = re.compile(r"Department\s*[:]?\s*(.+)", re.IGNORECASE)
+def extract_date_range(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract the report date range from ESSL report text.
 
+    Example:
+        Aug 01 2026 To Aug 31 2026
 
-@dataclass
-class ReportMetadata:
-    report_name: Optional[str] = None
-    month: Optional[str] = None
-    year: Optional[int] = None
-    days_in_month: Optional[int] = None
-    company: Optional[str] = None
-    department: Optional[str] = None
-    period_start: Optional[str] = None
-    period_end: Optional[str] = None
-    warnings: list[str] = field(default_factory=list)
+    Returns:
+        {
+            "start_date": "2026-08-01",
+            "end_date": "2026-08-31",
+            "month": 8,
+            "year": 2026,
+            "days_in_month": 31,
+            "date_range_text": "Aug 01 2026 To Aug 31 2026"
+        }
 
+    Returns None when the date range cannot be found.
+    """
+    if not text:
+        return None
 
-def extract_metadata(full_text: str, expected_title: str) -> ReportMetadata:
-    meta = ReportMetadata()
+    match = _DATE_RANGE_RE.search(text)
 
-    if expected_title.lower() in full_text.lower():
-        meta.report_name = expected_title
-    else:
-        # Grab whatever the first non-empty line says instead of failing hard.
-        first_line = next((l for l in full_text.splitlines() if l.strip()), None)
-        meta.report_name = first_line
-        meta.warnings.append(
-            f"Report title did not match expected '{expected_title}'."
+    if not match:
+        return None
+
+    start_month_text = match.group("start_month").strip().lower()
+    end_month_text = match.group("end_month").strip().lower()
+
+    start_month = _MONTH_NAME_TO_NUMBER.get(start_month_text)
+    end_month = _MONTH_NAME_TO_NUMBER.get(end_month_text)
+
+    if start_month is None or end_month is None:
+        return None
+
+    start_day = int(match.group("start_day"))
+    start_year = int(match.group("start_year"))
+
+    end_day = int(match.group("end_day"))
+    end_year = int(match.group("end_year"))
+
+    try:
+        import datetime
+
+        start_date = datetime.date(
+            start_year,
+            start_month,
+            start_day,
         )
 
-    date_match = _DATE_RANGE_RE.search(full_text)
-    if date_match:
-        start_str, end_str = date_match.group(1), date_match.group(2)
-        meta.period_start, meta.period_end = start_str, end_str
-        try:
-            start_dt = dateparser.parse(start_str)
-            end_dt = dateparser.parse(end_str)
-            meta.month = start_dt.strftime("%B")
-            meta.year = start_dt.year
-            meta.days_in_month = (end_dt - start_dt).days + 1
-        except (ValueError, OverflowError) as exc:
-            meta.warnings.append(f"Could not parse date range: {exc}")
-    else:
-        meta.warnings.append("Date range (e.g. 'Jul 01 2026 To Jul 31 2026') not found.")
+        end_date = datetime.date(
+            end_year,
+            end_month,
+            end_day,
+        )
+    except ValueError:
+        return None
 
-    # Fallback for days_in_month if the date range parse failed but we do
-    # have a month/year some other way — not expected in practice, but keep
-    # the report robust rather than crashing.
-    if meta.days_in_month is None and meta.month and meta.year:
-        month_num = list(calendar.month_name).index(meta.month) if meta.month in calendar.month_name else None
-        if month_num:
-            meta.days_in_month = calendar.monthrange(meta.year, month_num)[1]
+    if end_date < start_date:
+        return None
 
-    company_match = _COMPANY_RE.search(full_text)
-    if company_match:
-        meta.company = company_match.group(1).strip()
+    days_in_month = calendar.monthrange(
+        end_year,
+        end_month,
+    )[1]
 
-    dept_match = _DEPARTMENT_RE.search(full_text)
-    if dept_match:
-        meta.department = dept_match.group(1).strip()
-
-    return meta
+    return {
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "month": end_month,
+        "year": end_year,
+        "days_in_month": days_in_month,
+        "date_range_text": match.group(0),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Employee row tokenizing
-# ---------------------------------------------------------------------------
-def split_employee_row(line: str, days_in_month: int) -> Optional[dict]:
+def split_employee_row(
+    line: str,
+    days_in_month: int,
+) -> Optional[Dict[str, Any]]:
     """
-    Attempt to split one text line from the report into its component
-    parts: Sl No, Employee Code, Employee Name, daily status list, and the
-    trailing summary numbers (P A L H HP WO WOP).
+    Parse one ESSL employee row.
 
-    Returns None if the line doesn't look like an employee data row at all
-    (e.g. it's a header/footer/title line).
+    This is the critical fix.
 
-    This never assumes fixed column positions — it works from both ends of
-    the token list inward, so it tolerates the header text reflowing or the
-    exact spacing changing between exports.
+    OLD APPROACH:
+        Expected exactly 31 daily status tokens.
+
+    PROBLEM:
+        pdfplumber removes empty PDF table cells.
+        Late joiners and zero-attendance employees therefore have
+        fewer extracted tokens.
+
+    NEW APPROACH:
+        First two tokens:
+            Sl
+            Emp Code
+
+        Final seven numeric tokens:
+            P A L H HP WO WOP
+
+        Middle section:
+            Employee name + whatever daily status tokens survived
+            PDF text extraction.
+
+        We walk backwards through the middle section and consume
+        recognized attendance statuses. Everything before those
+        statuses is treated as the employee name.
+
+    Examples:
+
+        Normal employee:
+        1 3 Rohit Bhalekar P WO P ... P 20 3 0 0 0 6 0
+
+        Late joiner:
+        48 71 Paresh Jadhav A A WO P P ... P 16 3 0 0 0 5 0
+
+        No attendance:
+        1 1 1 A 0 1 0 0 0 0 0
+
+    Returns:
+        {
+            "employee_id": "...",
+            "employee_name": "...",
+            "status_tokens": [...],
+            "summary": {
+                "P": ...,
+                "A": ...,
+                "L": ...,
+                "H": ...,
+                "HP": ...,
+                "WO": ...,
+                "WOP": ...
+            },
+            "raw_line": line
+        }
+
+    Returns None when the row cannot be structurally identified.
     """
+    if not line:
+        return None
+
+    line = " ".join(str(line).split())
+
+    if not line:
+        return None
+
     tokens = line.split()
 
-    min_len = 2 + 1 + days_in_month + NUM_SUMMARY_COLUMNS  # Sl + Code + >=1 name word + statuses + summary
-    if len(tokens) < min_len:
+    # Need:
+    #   first 2 tokens -> Sl + Emp Code
+    #   last 7 tokens -> summary
+    #
+    # At minimum this leaves one middle token.
+    if len(tokens) < (2 + NUM_SUMMARY_COLUMNS + 1):
         return None
 
-    sl_token, code_token = tokens[0], tokens[1]
-    if not (sl_token.isdigit() and code_token.isdigit()):
-        # Header rows ("Sl Emp. Code Name ...") and continuation header rows
-        # ("St M W Th ...") don't start with two integers.
+    sl_token = tokens[0]
+    employee_code_token = tokens[1]
+
+    # Sl and employee code must be numeric.
+    if not sl_token.isdigit():
         return None
 
-    tail = tokens[-NUM_SUMMARY_COLUMNS:]
-    if not all(is_numeric_token(t) for t in tail):
+    if not is_numeric_token(employee_code_token):
         return None
 
-    status_tokens = tokens[-(NUM_SUMMARY_COLUMNS + days_in_month): -NUM_SUMMARY_COLUMNS]
-    name_tokens = tokens[2: -(NUM_SUMMARY_COLUMNS + days_in_month)]
+    # Last seven values are the ESSL summary columns.
+    summary_tokens = tokens[-NUM_SUMMARY_COLUMNS:]
 
-    if not name_tokens or len(status_tokens) != days_in_month:
+    if not all(is_numeric_token(token) for token in summary_tokens):
+        return None
+
+    summary: Dict[str, float | int] = {}
+
+    for column_name, raw_value in zip(
+        SUMMARY_COLUMNS,
+        summary_tokens,
+    ):
+        summary[column_name] = to_display_number(
+            to_number(raw_value)
+        )
+
+    # Everything between employee code and the summary.
+    middle_tokens = tokens[2:-NUM_SUMMARY_COLUMNS]
+
+    if not middle_tokens:
+        return None
+
+    # Walk backwards through the middle section.
+    #
+    # Why backwards?
+    #
+    # The daily statuses are always located immediately before the
+    # summary in an employee row. We do not need to know how many
+    # status cells were originally present.
+    status_tokens_reversed: List[str] = []
+
+    index = len(middle_tokens) - 1
+
+    while index >= 0:
+        normalized = normalize_status(
+            middle_tokens[index]
+        )
+
+        if normalized is None:
+            break
+
+        status_tokens_reversed.append(normalized)
+        index -= 1
+
+    status_tokens = list(reversed(status_tokens_reversed))
+
+    # Remaining prefix is the employee name.
+    name_tokens = middle_tokens[: index + 1]
+
+    employee_name = " ".join(name_tokens).strip()
+
+    if not employee_name:
         return None
 
     return {
         "sl": sl_token,
-        "employee_code": code_token,
-        "employee_name": " ".join(name_tokens),
+        "employee_id": employee_code_token,
+        "employee_name": employee_name,
         "status_tokens": status_tokens,
-        "summary_tokens": tail,
+        "summary": summary,
+        "raw_line": line,
+        "daily_status_count": len(status_tokens),
+        "daily_status_complete": len(status_tokens) == days_in_month,
     }
 
 
-# ---------------------------------------------------------------------------
-# Attendance calculation from daily status cells
-# ---------------------------------------------------------------------------
-def calculate_fallback_present(status_tokens: list[str]) -> tuple[float, list[str]]:
-    """Return (days_present, unmapped_tokens) using FALLBACK_STATUS_WEIGHTS."""
+def calculate_fallback_present(
+    status_tokens: List[str],
+    fallback_weights: Optional[Dict[str, float]] = None,
+) -> float:
+    """
+    Calculate days present from daily status tokens.
+
+    This should be used only when the machine summary is unavailable
+    or considered invalid.
+
+    Default weights:
+        P   = 1
+        ½P  = 0.5
+        A   = 0
+        WO  = 0
+        WOP = 0
+        L   = 0
+        H   = 0
+        HP  = 0
+    """
+    if fallback_weights is None:
+        fallback_weights = DEFAULT_FALLBACK_WEIGHTS
+
     total = 0.0
-    unmapped = []
-    for tok in status_tokens:
-        if tok in FALLBACK_STATUS_WEIGHTS:
-            total += FALLBACK_STATUS_WEIGHTS[tok]
-        else:
-            unmapped.append(tok)
-    return total, unmapped
+
+    for raw_status in status_tokens:
+        status = normalize_status(raw_status)
+
+        if status is None:
+            continue
+
+        total += float(
+            fallback_weights.get(status, 0.0)
+        )
+
+    return total
 
 
-def calculate_absent_days(status_tokens: list[str]) -> tuple[int, list[int]]:
-    """Return (absent_count, [1-indexed day numbers]) based on 'A' statuses."""
-    days = [i + 1 for i, tok in enumerate(status_tokens) if tok in ABSENT_STATUS]
-    return len(days), days
+def calculate_absent_days(
+    status_tokens: List[str],
+    *,
+    days_in_month: Optional[int] = None,
+    complete_only: bool = True,
+) -> List[int]:
+    """
+    Return 1 based absent day numbers.
+
+    IMPORTANT:
+        pdfplumber can remove blank PDF cells.
+
+    Therefore, when the daily status sequence is shorter than the
+    actual month, its positions cannot safely be mapped back to
+    calendar dates.
+
+    By default:
+        complete_only=True
+
+    means absent day numbers are returned only when all daily
+    status cells were successfully extracted.
+
+    For incomplete rows:
+        []
+
+    is returned rather than returning incorrect calendar dates.
+
+    This prevents a late joiner's absence sequence from being
+    incorrectly shifted to day 1, day 2, day 3, etc.
+    """
+    if not status_tokens:
+        return []
+
+    if (
+        complete_only
+        and days_in_month is not None
+        and len(status_tokens) != days_in_month
+    ):
+        return []
+
+    absent_days: List[int] = []
+
+    for day_index, raw_status in enumerate(
+        status_tokens,
+        start=1,
+    ):
+        status = normalize_status(raw_status)
+
+        if status in ABSENT_STATUS:
+            absent_days.append(day_index)
+
+    return absent_days
+
+
+def summarize_status_tokens(
+    status_tokens: List[str],
+) -> Dict[str, float]:
+    """
+    Produce a summary from extracted daily statuses.
+
+    This is primarily useful for validation/debugging.
+    """
+    result = {
+        column: 0.0
+        for column in SUMMARY_COLUMNS
+    }
+
+    for raw_status in status_tokens:
+        status = normalize_status(raw_status)
+
+        if status in result:
+            result[status] += 1.0
+
+    return result
+
+
+def is_complete_daily_sequence(
+    status_tokens: List[str],
+    days_in_month: int,
+) -> bool:
+    """
+    Return True when the expected number of daily cells survived
+    text extraction.
+    """
+    return len(status_tokens) == days_in_month
+
+
+def calculate_daily_present_from_tokens(
+    status_tokens: List[str],
+    fallback_weights: Optional[Dict[str, float]] = None,
+) -> float:
+    """
+    Convenience wrapper for fallback present calculation.
+    """
+    return calculate_fallback_present(
+        status_tokens=status_tokens,
+        fallback_weights=fallback_weights,
+    )
