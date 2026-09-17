@@ -1,14 +1,23 @@
 """
 ESSL Monthly Status Report parser.
 
-Primary source of attendance:
-    ESSL machine generated P summary.
+Primary attendance source:
+    ESSL machine generated summary columns.
 
-Fallback source:
+Fallback attendance source:
     Extracted daily attendance statuses.
 
-The parser is intentionally tolerant of missing daily PDF cells because
-pdfplumber may omit blank cells when converting the ESSL table to text.
+Important:
+    pdfplumber does not reliably preserve empty PDF table cells.
+    Therefore, this parser does not require exactly 31 daily status
+    tokens to be present in the extracted text.
+
+The parser uses the stable structure of each ESSL employee row:
+
+    Sl Emp.Code Name <daily statuses> P A L H HP WO WOP
+
+The final seven numeric values are treated as the authoritative
+machine generated summary.
 """
 
 from __future__ import annotations
@@ -16,11 +25,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import io
+
 import pdfplumber
 
 from config import (
     ABSENT_STATUS,
-    FALLBACK_WEIGHTS,
+    FALLBACK_STATUS_WEIGHTS,
     SUMMARY_COLUMNS,
 )
 from utils import (
@@ -34,9 +45,7 @@ from utils import (
 
 @dataclass
 class ReportMetadata:
-    """
-    Metadata extracted from the ESSL report.
-    """
+    """Metadata extracted from the ESSL report."""
 
     start_date: Optional[str] = None
     end_date: Optional[str] = None
@@ -49,9 +58,7 @@ class ReportMetadata:
 
 @dataclass
 class FailedRow:
-    """
-    A row that looked like an employee row but could not be parsed.
-    """
+    """A row that appeared to be an employee row but could not be parsed."""
 
     line_number: int
     raw_line: str
@@ -62,6 +69,9 @@ class FailedRow:
 class EmployeeRecord:
     """
     Normalized employee attendance record.
+
+    This class intentionally keeps compatibility with excel_writer.py,
+    which expects a to_output_row() method.
     """
 
     employee_id: str
@@ -76,7 +86,6 @@ class EmployeeRecord:
 
     warnings: List[str] = field(default_factory=list)
 
-    # Additional information useful for validation/debugging.
     summary: Dict[str, Any] = field(default_factory=dict)
 
     status_tokens: List[str] = field(default_factory=list)
@@ -87,19 +96,36 @@ class EmployeeRecord:
 
     raw_line: str = ""
 
+    def to_output_row(self) -> Dict[str, Any]:
+        """
+        Convert the record into the structure expected by excel_writer.py.
+        """
+        absent_days_text = ", ".join(
+            str(day)
+            for day in self.absent_days
+        )
+
+        return {
+            "Employee ID": self.employee_id,
+            "Employee Name": self.employee_name,
+            "Days Present": self.days_present,
+            "Absent Count": self.absent_count,
+            "Absent Days": absent_days_text,
+        }
+
 
 @dataclass
 class ParseResult:
-    """
-    Result returned by parse_report().
-    """
+    """Result returned by parse_report()."""
 
     records: List[EmployeeRecord]
+
     failed_rows: List[FailedRow]
+
     metadata: ReportMetadata
 
-    # Useful counters exposed directly for the Streamlit UI.
     employees_found: int = 0
+
     fallback_used: int = 0
 
     @property
@@ -112,9 +138,7 @@ class ParseResult:
 
 
 def _normalize_number(value: Any) -> float | int:
-    """
-    Convert numeric values into a cleaner int/float representation.
-    """
+    """Convert 20.0 to 20 while preserving values such as 13.5."""
     numeric = float(value)
 
     if numeric.is_integer():
@@ -127,7 +151,8 @@ def _looks_like_employee_row(line: str) -> bool:
     """
     Quick structural check.
 
-    ESSL employee rows begin with:
+    ESSL employee rows start with:
+
         Sl
         Emp Code
     """
@@ -139,10 +164,17 @@ def _looks_like_employee_row(line: str) -> bool:
     if len(tokens) < 2:
         return False
 
-    return (
-        tokens[0].isdigit()
-        and tokens[1].replace(".", "", 1).isdigit()
-    )
+    first = tokens[0]
+    second = tokens[1]
+
+    if not first.isdigit():
+        return False
+
+    try:
+        float(second)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _is_summary_valid(
@@ -152,16 +184,12 @@ def _is_summary_valid(
     """
     Validate the ESSL machine summary.
 
-    We primarily trust the ESSL summary when its values are
-    structurally valid.
+    The summary columns are:
 
-    P and A must be non negative.
+        P A L H HP WO WOP
 
-    P should never exceed the number of calendar days in the month.
-
-    A should never exceed the number of calendar days in the month.
-
-    Other summary values are also required to be non negative.
+    P and A cannot be negative and cannot exceed the number of
+    calendar days in the reporting month.
     """
     for column in SUMMARY_COLUMNS:
         if column not in summary:
@@ -195,24 +223,22 @@ def _daily_summary_matches_machine_summary(
     summary: Dict[str, Any],
 ) -> bool:
     """
-    Compare the extracted daily status sequence to the machine
-    generated P summary.
+    Compare daily derived present days with the ESSL P summary.
 
-    This is only used when the daily sequence is complete.
-
-    For incomplete sequences, the comparison is not meaningful and
-    therefore returns True rather than treating missing PDF cells as
-    a mismatch.
+    This check is meaningful only when a complete daily sequence
+    was extracted.
     """
     if not status_tokens:
         return False
 
     derived_present = calculate_fallback_present(
         status_tokens,
-        FALLBACK_WEIGHTS,
+        FALLBACK_STATUS_WEIGHTS,
     )
 
-    machine_present = float(summary["P"])
+    machine_present = float(
+        summary["P"]
+    )
 
     return abs(
         derived_present - machine_present
@@ -226,11 +252,12 @@ def _parse_row(
     """
     Convert split_employee_row() output into EmployeeRecord.
 
-    Attendance source priority:
+    Attendance priority:
 
-        1. ESSL summary P
-        2. daily status fallback only when summary is invalid
+        1. ESSL machine summary
+        2. Daily status fallback
     """
+
     employee_id = str(
         row_data["employee_id"]
     ).strip()
@@ -239,19 +266,22 @@ def _parse_row(
         row_data["employee_name"]
     ).strip()
 
-    status_tokens = [
-        normalize_status(status)
-        for status in row_data.get(
-            "status_tokens",
-            [],
-        )
-    ]
+    raw_status_tokens = row_data.get(
+        "status_tokens",
+        [],
+    )
 
-    status_tokens = [
-        status
-        for status in status_tokens
-        if status is not None
-    ]
+    status_tokens: List[str] = []
+
+    for raw_status in raw_status_tokens:
+        normalized = normalize_status(
+            raw_status
+        )
+
+        if normalized is not None:
+            status_tokens.append(
+                normalized
+            )
 
     summary = row_data.get(
         "summary",
@@ -270,23 +300,9 @@ def _parse_row(
     )
 
     # ---------------------------------------------------------
-    # PRIMARY SOURCE
+    # PRIMARY SOURCE: ESSL MACHINE SUMMARY
     # ---------------------------------------------------------
-    #
-    # Use the machine generated P summary whenever valid.
-    #
-    # Example:
-    #     ... 21 2 0 0 0 6 0
-    #
-    # This means:
-    #     P   = 21
-    #     A   = 2
-    #     L   = 0
-    #     H   = 0
-    #     HP  = 0
-    #     WO  = 6
-    #     WOP = 0
-    #
+
     if _is_summary_valid(
         summary,
         metadata.days_in_month,
@@ -301,17 +317,8 @@ def _parse_row(
 
         source = "summary"
 
-        # -----------------------------------------------------
-        # Absence dates
-        # -----------------------------------------------------
-        #
-        # We only derive exact absence day numbers if all
-        # daily cells were preserved.
-        #
-        # For late joiners the PDF text extraction can omit
-        # leading blank cells. Returning shifted absence dates
-        # would be worse than returning no dates.
-        #
+        # We can derive exact absent day numbers only if all
+        # daily cells survived PDF text extraction.
         absent_days = calculate_absent_days(
             status_tokens,
             days_in_month=metadata.days_in_month,
@@ -322,26 +329,26 @@ def _parse_row(
             warnings.append(
                 "Daily attendance cells were incomplete after PDF "
                 "text extraction. ESSL summary P/A values were used "
-                "as the authoritative attendance totals. Exact "
-                "absence dates were not derived."
+                "as authoritative attendance totals. Exact absence "
+                "dates were not derived."
             )
 
         else:
-            # Complete sequence available.
-            # Compare daily derived present to machine summary.
             if not _daily_summary_matches_machine_summary(
                 status_tokens,
                 summary,
             ):
                 warnings.append(
-                    "Daily attendance total did not exactly match "
-                    "the ESSL machine summary P value. The ESSL "
-                    "machine summary was retained as authoritative."
+                    "Extracted daily attendance did not exactly "
+                    "match the ESSL machine summary P value. "
+                    "The ESSL machine summary was retained as "
+                    "authoritative."
                 )
 
     # ---------------------------------------------------------
-    # FALLBACK SOURCE
+    # FALLBACK SOURCE: DAILY STATUS TOKENS
     # ---------------------------------------------------------
+
     else:
         if not status_tokens:
             raise ValueError(
@@ -352,7 +359,7 @@ def _parse_row(
         days_present = _normalize_number(
             calculate_fallback_present(
                 status_tokens,
-                FALLBACK_WEIGHTS,
+                FALLBACK_STATUS_WEIGHTS,
             )
         )
 
@@ -362,33 +369,30 @@ def _parse_row(
             complete_only=True,
         )
 
-        # Since the status list is potentially incomplete,
-        # do not pretend the derived absence count is complete.
         if daily_status_complete:
-            absent_count = len(absent_days)
+            absent_count = len(
+                absent_days
+            )
         else:
-            # Summary is invalid and exact A count cannot be
-            # trusted. Count only the extracted A tokens.
             absent_count = sum(
                 1
                 for status in status_tokens
                 if status in ABSENT_STATUS
             )
 
-            warnings.append(
-                "ESSL machine summary was invalid. Attendance was "
-                "calculated from extracted daily statuses. The "
-                "daily status sequence was incomplete, so absence "
-                "dates may not be fully recoverable."
-            )
-
         source = "daily_fallback"
 
         warnings.append(
-            "Attendance totals were calculated from daily "
-            "attendance status tokens because the ESSL summary "
-            "could not be validated."
+            "ESSL machine summary was invalid. Attendance "
+            "was calculated from extracted daily status tokens."
         )
+
+        if not daily_status_complete:
+            warnings.append(
+                "Daily attendance sequence was incomplete after "
+                "PDF text extraction, so exact absence dates "
+                "could not be reliably determined."
+            )
 
     return EmployeeRecord(
         employee_id=employee_id,
@@ -418,9 +422,8 @@ def _extract_metadata(
     full_text: str,
     pdf_name: Optional[str],
 ) -> ReportMetadata:
-    """
-    Extract report metadata from the complete PDF text.
-    """
+    """Extract report metadata from the complete PDF text."""
+
     metadata = ReportMetadata(
         pdf_name=pdf_name,
         days_in_month=31,
@@ -468,58 +471,41 @@ def parse_report(
     """
     Parse an ESSL Monthly Status Report PDF.
 
-    Args:
-        pdf_bytes:
-            PDF file contents as bytes.
-
-        pdf_name:
-            Original uploaded filename.
-
-    Returns:
-        ParseResult
-
-    Parsing strategy:
-        1. Extract text from every page using pdfplumber.
-        2. Identify employee-like rows.
-        3. Parse the stable first two tokens.
-        4. Parse the stable final seven numeric summary values.
-        5. Treat the middle section as variable length.
-        6. Use ESSL P summary as authoritative Days Present.
-        7. Use daily statuses for validation and absence dates
-           only when complete.
+    The parser scans all pages and accepts employee rows even when
+    blank daily PDF cells were omitted by text extraction.
     """
+
     if not pdf_bytes:
         raise ValueError(
             "PDF input is empty."
         )
 
     records: List[EmployeeRecord] = []
+
     failed_rows: List[FailedRow] = []
 
     page_texts: List[str] = []
 
     try:
-        import io
-
         with pdfplumber.open(
             io.BytesIO(pdf_bytes)
         ) as pdf:
+
             for page in pdf.pages:
+
                 try:
                     text = page.extract_text(
                         x_tolerance=2,
                         y_tolerance=3,
                     )
 
-                    if text:
-                        page_texts.append(text)
-
                 except Exception:
-                    # Try normal extraction if tuned extraction fails.
                     text = page.extract_text()
 
-                    if text:
-                        page_texts.append(text)
+                if text:
+                    page_texts.append(
+                        text
+                    )
 
     except Exception as exc:
         raise RuntimeError(
@@ -531,7 +517,9 @@ def parse_report(
             "No extractable text was found in the PDF."
         )
 
-    full_text = "\n".join(page_texts)
+    full_text = "\n".join(
+        page_texts
+    )
 
     metadata = _extract_metadata(
         full_text=full_text,
@@ -541,7 +529,9 @@ def parse_report(
     line_number = 0
 
     for page_text in page_texts:
+
         for raw_line in page_text.splitlines():
+
             line_number += 1
 
             line = " ".join(
@@ -551,9 +541,9 @@ def parse_report(
             if not line:
                 continue
 
-            # Skip all obvious headers and footers quickly.
             lower_line = line.lower()
 
+            # Ignore report headers and footer/header fragments.
             if (
                 "monthly status report" in lower_line
                 or "department default" in lower_line
@@ -565,8 +555,7 @@ def parse_report(
             ):
                 continue
 
-            # We only attempt parsing for lines that start with
-            # numeric Sl and Emp Code.
+            # Only process lines that look like employee rows.
             if not _looks_like_employee_row(
                 line
             ):
@@ -583,9 +572,8 @@ def parse_report(
                         line_number=line_number,
                         raw_line=line,
                         reason=(
-                            "Could not identify employee name, "
-                            "daily statuses, and trailing ESSL "
-                            "summary columns."
+                            "Could not identify the employee "
+                            "name and trailing ESSL summary."
                         ),
                     )
                 )
@@ -593,8 +581,8 @@ def parse_report(
 
             try:
                 record = _parse_row(
-                    row_data,
-                    metadata,
+                    row_data=row_data,
+                    metadata=metadata,
                 )
 
                 records.append(
